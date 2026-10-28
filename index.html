@@ -246,6 +246,46 @@
     return null;
   }
 
+  // ---------------- безопасная запись .xlsx ----------------
+  // ExcelJS записывает дочерние элементы <font> в styles.xml не в том порядке,
+  // который требует схема Office Open XML (sz/color/name/family/scheme).
+  // Перед выдачей файла упорядочиваем их и убираем «пустое» закрепление
+  // областей — чтобы Excel открывал файлы без сообщения о восстановлении.
+  var FONT_CHILD_ORDER = ['b','i','strike','condense','extend','outline','shadow','u','vertAlign','sz','color','name','family','charset','scheme'];
+  function fixStylesXml(xml){
+    return xml.replace(/<font>([\s\S]*?)<\/font>/g, function(all, inner){
+      var parts = inner.match(/<([A-Za-z]+)\b[^>]*\/>|<([A-Za-z]+)\b[^>]*>[\s\S]*?<\/\2>/g) || [];
+      parts.sort(function(a, b){
+        var ta = a.match(/^<([A-Za-z]+)/)[1], tb = b.match(/^<([A-Za-z]+)/)[1];
+        var ia = FONT_CHILD_ORDER.indexOf(ta), ib = FONT_CHILD_ORDER.indexOf(tb);
+        return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      });
+      return '<font>' + parts.join('') + '</font>';
+    });
+  }
+  function fixSheetXml(xml){
+    // pane с state="frozen" без xSplit/ySplit некорректен — убираем его
+    return xml.replace(/<pane(?![^>]*\b[xy]Split="[1-9])[^>]*\/>/g, '')
+              .replace(/<selection pane="bottomLeft"\/>/g, '');
+  }
+  async function writeXlsx(wb){
+    var buf = await wb.xlsx.writeBuffer();
+    try {
+      var zip = await JSZip.loadAsync(buf);
+      var st = zip.file('xl/styles.xml');
+      if (st) zip.file('xl/styles.xml', fixStylesXml(await st.async('string')));
+      var sheetNames = Object.keys(zip.files).filter(function(n){ return /^xl\/worksheets\/sheet\d+\.xml$/.test(n); });
+      for (var i = 0; i < sheetNames.length; i++){
+        var x = await zip.file(sheetNames[i]).async('string');
+        zip.file(sheetNames[i], fixSheetXml(x));
+      }
+      return await zip.generateAsync({type:'arraybuffer', compression:'DEFLATE', compressionOptions:{level:6}, mimeType:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    } catch (e){
+      console.warn('writeXlsx post-process failed, using raw ExcelJS output', e);
+      return buf;
+    }
+  }
+
   // ---------------- вспомогательные ----------------
   function pctFillArgb(pct){
     if (pct < 50) return 'FFFFC9C9';
@@ -278,62 +318,104 @@
   // Классификация колонки-территории по подписи заголовка: "Московская обл." —
   // регион; "...(reg50_m015)" — муниципалитет; "...(edu500635)" — школа;
   // "РФ" — общероссийское значение (не выводим как отдельную территорию).
+  // Поддерживаются обе формы выгрузки «Достижение планируемых результатов»:
+  //  2026: Уровень сложности | Проверяемые результаты | Макс балл | территории…
+  //        территории подписаны кодами: «…(reg50_m015)», «…(edu500635)»;
+  //  2025: Блоки ПООП… | Макс балл | территории… (без столбца сложности),
+  //        школа — «edu500635 | Название», муниципалитет — без кода.
+  // Колонки находим по шапке (строка с «Макс балл»), а не по фиксированным номерам.
+  var REGION_RE = /(^|\s)(обл\.?|область|край|республика|автономный округ|ао)(\s|$)|^г\.?\s*(москва|санкт-петербург|севастополь)$|^(москва|санкт-петербург|севастополь)$/i;
   function classifyVprColumn(headerText){
-    var t = String(headerText || '').trim();
-    if (t === 'РФ') return 'russia';
-    if (/\(edu\d+\)/i.test(t)) return 'school';
+    var t = String(headerText || '').replace(/\s+/g, ' ').trim();
+    if (!t) return null;
+    if (t === 'РФ' || /^вся выборка$/i.test(t)) return 'russia';
+    if (/\(edu\d+\)/i.test(t) || /^edu\d+\s*\|/i.test(t)) return 'school';
     if (/\(reg\d+_m\d+\)/i.test(t)) return 'municipality';
-    if (t) return 'region';
-    return null;
+    if (REGION_RE.test(t)) return 'region';
+    return 'municipality-guess';
+  }
+
+  function vprTaskNum(tema, fallback){
+    var m = String(tema || '').match(/^\s*(\d+(?:\s*\(\d+\))?(?:\s*[KК]\d+)?)\s*[.)]\s/);
+    if (!m) return fallback;
+    var tn = m[1].replace(/\s+/g, '');
+    return /^\d+$/.test(tn) ? Number(tn) : tn;
   }
 
   function parseVprSheet(ws){
-    // строка 3: "ВПР 2026 <Предмет> <класс> класс"
-    var titleRow = ws.getRow ? null : null;
     var subject = null, grade = null;
-    for (var r = 1; r <= 6; r++){
+    for (var r = 1; r <= 8; r++){
       var v = getCellText(ws, r, 1);
       var m = v && v.match(/ВПР\s+\d{4}\s+(.+?)\s+(\d+)\s*класс/i);
       if (m){ subject = m[1].trim(); grade = m[2]; break; }
     }
-    // найдём заголовочную строку с "Уровень сложности задания" в кол.1 (или "Проверяемые предметные результаты" в кол.2)
-    var headerRow = null;
-    for (var r2 = 1; r2 <= 15; r2++){
-      var c1 = getCellText(ws, r2, 1);
-      var c2 = getCellText(ws, r2, 2);
-      if ((c1 && /уровень сложности/i.test(c1)) || (c2 && /проверяемые предметные результаты/i.test(c2))){
-        headerRow = r2; break;
+    var maxCol = getRowMaxCol(ws, 1);
+    // строка шапки: в ней есть ячейка «Макс балл»
+    var headerRow = null, maxBallCol = null;
+    for (var r2 = 1; r2 <= 20 && headerRow === null; r2++){
+      for (var c0 = 1; c0 <= Math.min(maxCol, 8); c0++){
+        if (/^макс\.?\s*балл/i.test(getCellText(ws, r2, c0))){ headerRow = r2; maxBallCol = c0; break; }
       }
     }
     if (!headerRow) return null;
-    var maxCol = getRowMaxCol(ws, headerRow);
+    var temaCol = null, levelCol = null;
+    for (var c1 = 1; c1 < maxBallCol; c1++){
+      var h = getCellText(ws, headerRow, c1);
+      if (/уровень сложности/i.test(h)) levelCol = c1;
+      else if (/проверяем|пооп|планируем|научится|умени|результат/i.test(h)) temaCol = c1;
+    }
+    if (!temaCol) temaCol = maxBallCol - 1;
+    if (temaCol < 1) return null;
+
     var columns = [];
-    for (var c = 4; c <= maxCol; c++){
+    for (var c = maxBallCol + 1; c <= maxCol; c++){
       var headerText = getCellText(ws, headerRow, c);
       var level = classifyVprColumn(headerText);
-      if (level) columns.push({col: c, label: cleanTerritoryLabel(headerText), level: level});
+      if (!level || level === 'russia') continue;
+      columns.push({col: c, label: cleanTerritoryLabel(headerText), level: level});
     }
+    // муниципалитет без кода (формат 2025): колонки между регионом и первой школой
+    columns.forEach(function(cc){ if (cc.level === 'municipality-guess') cc.level = 'municipality'; });
+
     var tasks = [];
-    var dataStart = headerRow + 2; // строка с "N уч." пропускаем
     var maxRow = getSheetMaxRow(ws);
-    for (var r3 = dataStart; r3 <= maxRow; r3++){
-      var lvl = getCellText(ws, r3, 1);
-      var tema = getCellText(ws, r3, 2);
-      var maxBall = getCellNum(ws, r3, 3);
-      if (!tema) continue;
+    for (var r3 = headerRow + 1; r3 <= maxRow; r3++){
+      var tema = getCellText(ws, r3, temaCol);
+      var maxBall = getCellNum(ws, r3, maxBallCol);
+      if (!tema || maxBall === null) continue; // строка «N уч.» и пустые строки
       var byCol = {};
       columns.forEach(function(cc){
         var pct = getCellNum(ws, r3, cc.col);
         if (pct !== null) byCol[cc.col] = pct;
       });
-      tasks.push({taskNum: tasks.length + 1, level: lvl, tema: tema, max: maxBall, byCol: byCol});
+      tasks.push({taskNum: vprTaskNum(tema, tasks.length + 1), level: levelCol ? getCellText(ws, r3, levelCol) : '', tema: tema, max: maxBall, byCol: byCol});
     }
     if (!tasks.length) return null;
     return {subject: subject, grade: grade, columns: columns, tasks: tasks};
   }
 
+  // Полные юридические названия школ (формат 2025) сокращаем по общепринятым
+  // правилам: «Муниципальное автономное общеобразовательное учреждение» → МАОУ,
+  // «средняя общеобразовательная школа» → СОШ и т.п.
+  var SCHOOL_ABBR = [
+    [/муниципальное\s+автономное\s+общеобразовательное\s+учреждение\s*/gi, 'МАОУ '],
+    [/муниципальное\s+бюджетное\s+общеобразовательное\s+учреждение\s*/gi, 'МБОУ '],
+    [/муниципальное\s+казённое\s+общеобразовательное\s+учреждение\s*|муниципальное\s+казенное\s+общеобразовательное\s+учреждение\s*/gi, 'МКОУ '],
+    [/муниципальное\s+общеобразовательное\s+учреждение\s*/gi, 'МОУ '],
+    [/частное\s+общеобразовательное\s+учреждение\s*/gi, 'ЧОУ '],
+    [/государственное\s+бюджетное\s+общеобразовательное\s+учреждение\s*/gi, 'ГБОУ '],
+    [/средняя\s+общеобразовательная\s+школа/gi, 'СОШ'],
+    [/основная\s+общеобразовательная\s+школа/gi, 'ООШ'],
+    [/начальная\s+общеобразовательная\s+школа/gi, 'НОШ'],
+    [/с\s+углубл[её]нным\s+изучением\s+отдельных\s+предметов/gi, 'с УИОП']
+  ];
   function cleanTerritoryLabel(t){
-    return String(t || '').replace(/\s*\((?:edu|reg)\d+(?:_m\d+)?\)\s*$/i, '').replace(/^"|"$/g, '').trim();
+    var s = String(t || '').replace(/\s+/g, ' ')
+      .replace(/\s*\((?:edu|reg)\d+(?:_m\d+)?\)?\s*$/i, '')
+      .replace(/^edu\d+\s*\|\s*/i, '')
+      .replace(/^"([^"]*)"$/, '$1').trim();
+    SCHOOL_ABBR.forEach(function(p){ s = s.replace(p[0], p[1]); });
+    return s.replace(/\s+/g, ' ').trim();
   }
 
   // ---------------- общие хелперы для чтения листа через SheetJS ----------------
@@ -367,13 +449,18 @@
   // Возвращает { bySubjectGrade: { "<Предмет> <класс> класс": { columns, deficitsByCol: {col: [{tema,max,pct,level}]} } } }
   function collectVprDeficits(files){
     var result = {}; // key: subject|grade -> {columns:[...], deficitsByCol:{col: []}}
+    var fileIssues = [];
     files.forEach(function(file){
       var wb = XLSX.read(file.data, {type:'array'});
+      var found = 0, recognized = 0;
       wb.SheetNames.forEach(function(sn){
-        if (!/достижение планируемых рез/i.test(sn)) return;
+        // имя листа обрезано до 31 символа: «…Достижение планируемых рез» / «…ре»
+        if (!/достижение\s+планир/i.test(sn)) return;
+        found++;
         var ws = wb.Sheets[sn];
         var parsed = parseVprSheet(ws);
         if (!parsed || !parsed.subject) return;
+        recognized++;
         var key = parsed.subject + '|' + parsed.grade;
         if (!result[key]) result[key] = {subject: parsed.subject, grade: parsed.grade, columns: parsed.columns, deficitsByCol: {}};
         var bucket = result[key];
@@ -389,7 +476,10 @@
           });
         });
       });
+      if (!found) fileIssues.push({file: file.name, message: 'нет листов «Достижение планируемых результатов» — загрузите полную выгрузку ВПР (отчёт ФИС ОКО со всеми листами)'});
+      else if (!recognized) fileIssues.push({file: file.name, message: 'листы «Достижение планируемых результатов» есть, но их структура не распознана'});
     });
+    Object.defineProperty(result, '__issues', {value: fileIssues, enumerable: false});
     return result;
   }
 
@@ -397,7 +487,7 @@
     return (async function(){
       var wb = new ExcelJS.Workbook();
       var keys = Object.keys(vprResult).sort();
-      if (!keys.length){ wb.addWorksheet('Нет данных'); return await wb.xlsx.writeBuffer(); }
+      if (!keys.length){ wb.addWorksheet('Нет данных'); return await writeXlsx(wb); }
       keys.forEach(function(key){
         var bucket = vprResult[key];
         var sheetLabel = bucket.subject + ' ' + bucket.grade + ' кл.';
@@ -435,7 +525,7 @@
         if (!any){ setCell(ws, row, 1, '(дефицитов <50% не выявлено)'); }
         ws.columns = [{width:34},{width:16},{width:11},{width:50},{width:11},{width:11},{width:14}];
       });
-      return await wb.xlsx.writeBuffer();
+      return await writeXlsx(wb);
     })();
   }
 
@@ -600,7 +690,7 @@
   async function writeOgeDeficitWorkbook(ogeResult){
     var wb = new ExcelJS.Workbook();
     var codes = Object.keys(ogeResult.schools).sort();
-    if (!codes.length){ wb.addWorksheet('Нет данных'); return await wb.xlsx.writeBuffer(); }
+    if (!codes.length){ wb.addWorksheet('Нет данных'); return await writeXlsx(wb); }
     var spec = OGE_SPECS['Математика'];
     var temaByNum = {};
     spec.tasks.forEach(function(t){ temaByNum[t.task_num] = t; });
@@ -634,7 +724,7 @@
       if (!items.length){ setCell(ws, row, 1, '(дефицитов <50% не выявлено)'); }
       ws.columns = [{width:11},{width:50},{width:36},{width:11},{width:14}];
     });
-    return await wb.xlsx.writeBuffer();
+    return await writeXlsx(wb);
   }
 
   // ---------------- UI wiring ----------------
@@ -743,6 +833,11 @@
     if (ogeResult.parseIssues.length){
       warnHtml += '<div class="riku-bad">⚠ Не удалось разобрать (файл пропущен, чтобы не выдать неверные данные):<br>' +
         ogeResult.parseIssues.map(function(pi){ return '— ' + pi.file + (pi.sheet ? (' / ' + pi.sheet) : '') + ': ' + pi.message; }).join('<br>') + '</div>';
+    }
+    var vprIssues = vprResult.__issues || [];
+    if (vprIssues.length){
+      warnHtml += '<div class="riku-bad">⚠ ВПР: не удалось разобрать файлы:<br>' +
+        vprIssues.map(function(pi){ return '— ' + pi.file + ': ' + pi.message; }).join('<br>') + '</div>';
     }
     if (!vprFiles.length && !ogeFiles.length){
       warnHtml += '<div class="riku-warn">Файлы не загружены.</div>';
